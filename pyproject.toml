@@ -1,0 +1,15 @@
+[project]
+name = "nanonext"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.4",
+    "datasets>=2.20",
+]
+
+[project.optional-dependencies]
+fla = ["flash-linear-attention>=0.2.2"]
+causal_conv1d = ["causal-conv1d>=1.4.0"]
+all = ["flash-linear-attention>=0.2.2", "causal-conv1d>=1.4.0"]

@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Reference repos (not needed for runtime)
+transformers/
+flash-linear-attention/
+causal-conv1d/
+
+# Benchmark outputs
+benchmark_results*.png
+
+# Training outputs
+checkpoints/
