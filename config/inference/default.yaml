@@ -1,0 +1,5 @@
+# Default generation settings for nanoNext inference demos.
+max_tokens: 50
+temperature: 1.0
+top_k: 200
+device: cuda

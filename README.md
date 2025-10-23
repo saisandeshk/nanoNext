@@ -8,6 +8,7 @@ Minimal, production-ready re-implementation of the **Qwen3-Next 80B architecture
 ✅ **Required optimized kernels** - causal-conv1d + flash-linear-attention (7-10x faster)  
 ✅ **bfloat16 mixed precision** - Automatic dtype handling  
 ✅ **Comprehensive benchmarking** - Text output + beautiful matplotlib visualizations  
+✅ **YAML-first configuration** - Hot-swap demo/full presets under `config/`  
 ✅ **Clean, hackable code** - Inspired by nanoGPT philosophy  
 
 ## Quick Start
@@ -16,7 +17,7 @@ Minimal, production-ready re-implementation of the **Qwen3-Next 80B architecture
 # Setup
 uv sync
 
-# Train
+# Train (edit config/train/demo.yaml for defaults)
 uv run train.py --steps 100
 
 # Generate
@@ -44,6 +45,9 @@ uv run train.py --steps 1000
 
 # Train FULL model (96 layers, 2x Qwen3-Next)
 uv run train.py --full-model --steps 1000
+
+# Train with explicit YAML
+uv run train.py --model-config config/models/demo.yaml --train-config config/train/demo.yaml --steps 1000
 
 # Generate text from checkpoint
 uv run inf.py --checkpoint checkpoints/step_100.pt --prompt "Once upon a time"
@@ -180,30 +184,33 @@ loss.backward()
 
 Default config is **2x Qwen3-Next 80B** (48 layers → 96 layers):
 
-```python
-NanoNextConfig(
-    vocab_size=151_936,
-    hidden_size=3072,
-    intermediate_size=5632,
-    num_hidden_layers=96,  # 2x the base Qwen3-Next (48 → 96)
-    num_attention_heads=16,
-    num_key_value_heads=2,
-    head_dim=256,
-    # Linear attention params
-    linear_num_key_heads=16,
-    linear_num_value_heads=32,
-    linear_key_head_dim=128,
-    linear_value_head_dim=128,
-    linear_conv_kernel_dim=4,
-    # MoE params
-    num_experts=512,
-    num_experts_per_tok=10,
-    moe_intermediate_size=512,
-    shared_expert_intermediate_size=512,
-    # Every 4th layer is full attention
-    layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 12,
-)
+```yaml
+# config/models/full.yaml
+vocab_size: 151936
+hidden_size: 3072
+intermediate_size: 5632
+num_hidden_layers: 96
+num_attention_heads: 16
+num_key_value_heads: 2
+head_dim: 256
+linear_key_head_dim: 128
+linear_value_head_dim: 128
+linear_num_key_heads: 16
+linear_num_value_heads: 32
+linear_conv_kernel_dim: 4
+max_position_embeddings: 262144
+partial_rotary_factor: 0.25
+rope_theta: 10000.0
+rms_norm_eps: 1e-6
+decoder_sparse_step: 1
+moe_intermediate_size: 512
+shared_expert_intermediate_size: 512
+num_experts_per_tok: 10
+num_experts: 512
+router_aux_loss_coef: 0.001
 ```
+Update `config/models/demo.yaml` for the 2-layer preset, `config/train/demo.yaml` for loop settings, and `config/inference/default.yaml` for sampling defaults.
+
 
 ## Requirements
 
@@ -280,22 +287,32 @@ Custom cache implementation for mixed attention:
 
 ```
 nanoNext/
-├── train.py                  # Training script (uv run train.py)
-├── inf.py                    # Inference script (uv run inf.py)
-├── benchmark.py              # Benchmark CLI
-├── README.md                 # This file
-├── pyproject.toml            # Dependencies
-└── nanoNext/                 # Core package
+├── config/
+│   ├── models/
+│   │   ├── demo.yaml          # 2-layer educational preset
+│   │   └── full.yaml          # 96-layer Qwen3-Next preset
+│   ├── train/
+│   │   └── demo.yaml          # Default training loop settings
+│   └── inference/
+│       └── default.yaml       # Default sampling parameters
+├── train.py                   # CLI adapter for training
+├── inf.py                     # CLI adapter for inference
+├── benchmark.py               # Benchmark CLI
+├── README.md                  # This file
+├── pyproject.toml             # Dependencies
+└── nanoNext/                  # Core library code
     ├── __init__.py
-    ├── model.py              # Main model classes
-    ├── config.py             # Configuration (96-layer default)
-    ├── cache.py              # DynamicCache implementation
-    ├── utils.py              # Import checks
-    ├── benchmark.py          # Benchmarks (text + visualization)
+    ├── config.py              # Dataclasses + YAML loaders
+    ├── training.py            # Pure training utilities
+    ├── inference.py           # Prefill/decode helpers
+    ├── model.py               # Model definitions
+    ├── cache.py               # Dynamic cache implementation
+    ├── utils.py               # Kernel availability checks
+    ├── benchmark.py           # Benchmark helpers
     └── modules/
-        ├── attention.py      # Attention mechanisms
-        ├── moe.py            # Sparse MoE
-        └── norm.py           # RMSNorm
+        ├── attention.py       # Attention mechanisms
+        ├── moe.py             # Sparse MoE
+        └── norm.py            # RMSNorm layer
 ```
 
 ## CLI Options
@@ -305,18 +322,26 @@ nanoNext/
 ```bash
 uv run train.py [OPTIONS]
 
-Options:
-  --steps N                 Training steps (default: 100)
-  --seq-len N              Sequence length (default: 256)
-  --batch N                Batch size (default: 8)
-  --dataset NAME           HuggingFace dataset (default: wikitext)
-  --dataset-config CFG     Dataset config (default: wikitext-2-raw-v1)
-  --checkpoint-dir DIR     Checkpoint directory (default: checkpoints)
-  --checkpoint-interval N  Save every N steps (default: 100)
-  --full-model             Use 96-layer config (default: 2-layer demo)
-  --benchmark              Run benchmarks before training
-  --benchmark-only         Run benchmarks and exit
-  --visualize              Generate visualization and exit
+Core config:
+  --model-config PATH        Path to model YAML (default: config/models/demo.yaml)
+  --train-config PATH        Path to training YAML (default: config/train/demo.yaml)
+  --full-model               Shortcut for config/models/full.yaml
+
+Overrides:
+  --steps N                  Override training steps
+  --seq-len N                Override sequence length
+  --batch N                  Override batch size
+  --dataset NAME             Override dataset name
+  --dataset-config CFG       Override dataset config
+  --eval-steps N             Override evaluation steps
+  --eval-freq N              Override evaluation frequency
+  --checkpoint-dir DIR       Override checkpoint directory
+  --checkpoint-interval N    Override checkpoint interval
+
+Benchmarks:
+  --benchmark                Run benchmarks before training
+  --benchmark-only           Run benchmarks and exit
+  --visualize                Generate visualization and exit
 ```
 
 ### Inference
@@ -324,13 +349,16 @@ Options:
 ```bash
 uv run inf.py [OPTIONS]
 
-Options:
-  --checkpoint PATH    Path to checkpoint file (required)
-  --prompt TEXT        Input prompt (default: "Once upon a time")
-  --max-tokens N       Tokens to generate (default: 50)
-  --temperature F      Sampling temperature (default: 1.0)
-  --top-k N            Top-k sampling (default: 200)
-  --device DEVICE      Device to use (default: cuda)
+Config:
+  --checkpoint PATH          Path to checkpoint file (required)
+  --inference-config PATH    Path to inference YAML (default: config/inference/default.yaml)
+
+Overrides:
+  --prompt TEXT              Prompt text (default: "Once upon a time")
+  --max-tokens N             Override tokens to generate
+  --temperature F            Override sampling temperature
+  --top-k N                  Override top-k sampling
+  --device DEVICE            Override device (cpu/cuda)
 ```
 
 ### Benchmarking

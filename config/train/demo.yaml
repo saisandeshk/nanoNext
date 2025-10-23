@@ -1,0 +1,10 @@
+# Default training loop parameters for quick nanoNext experiments.
+dataset: wikitext
+dataset_config: wikitext-2-raw-v1
+seq_len: 256
+batch: 8
+steps: 100
+eval_steps: 5
+eval_freq: 50
+checkpoint_dir: checkpoints
+checkpoint_interval: 100
