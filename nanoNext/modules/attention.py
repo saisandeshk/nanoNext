@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import math
 
 import torch
 import torch.nn as nn
@@ -30,10 +31,11 @@ from fla.modules import FusedRMSNormGated
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 
+# KV-Cache 
 @dataclass
 class AttentionCache:
-    key: torch.Tensor
-    value: torch.Tensor
+    key: torch.Tensor # [B, num_kv_heads, T_max, D]
+    value: torch.Tensor # [B, num_kv_heads, T_max, D]
 
 
 def create_attention_cache(
@@ -48,13 +50,14 @@ def create_attention_cache(
     value = torch.zeros_like(key)
     return AttentionCache(key=key, value=value)
 
-
+# RoPE helpers 
 class RotaryEmbedding(nn.Module):
     """Minimal rotary embedding implementation with optional partial rotary factor."""
 
     def __init__(self, config: NanoNextConfig):
         super().__init__()
         self.dim = int(config.head_dim * config.partial_rotary_factor)
+        # must be even and <= head_dim
         if self.dim % 2 != 0:
             self.dim -= self.dim % 2
         inv_freq = 1.0 / (
@@ -62,10 +65,11 @@ class RotaryEmbedding(nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype):
-        positions = torch.arange(seq_len, device=device).type_as(self.inv_freq)
-        freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype, start_pos: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        # positions: [T], inv_freq: [dim/2]
+        positions = torch.arange(start_pos, start_pos + seq_len, device=device).type(dtype)
+        freqs = torch.einsum("i,j->ij", positions, self.inv_freq) # [T, dim/2]
+        emb = torch.cat((freqs, freqs), dim=-1) # [T, dim]
         return emb.cos().to(dtype), emb.sin().to(dtype)
 
 
@@ -81,7 +85,44 @@ def apply_rotary(query: torch.Tensor, key: torch.Tensor, cos: torch.Tensor, sin:
     k_rot = (k_rot * cos) + (rotate_half(k_rot) * sin)
     return torch.cat((q_rot, q_pass), dim=-1), torch.cat((k_rot, k_pass), dim=-1)
 
+# Utils 
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch_size, num_kv_heads, seq_len, head_dim = hidden_states.size()
+
+    if n_rep == 1:
+        return hidden_states
+    
+    # hidden_states = hidden_states.repeat_interleave(n_rep, dim=1) # -> Memory inefficient 
+    hidden_states = hidden_states.unsqueeze(2) # -> Memory efficient 
+    hidden_states = hidden_states.expand(batch_size, num_kv_heads, n_rep, seq_len, head_dim)
+
+    return hidden_states.reshape(batch_size, num_kv_heads * n_rep, seq_len, head_dim)
+
+def _normalize_attn_mask(attn_mask: Optional[torch.Tensor], q: torch.Tensor) -> Optional[torch.Tensor]:
+    if attn_mask is None:
+        return None 
+    # Except broadcastable to [B, H, T_q, T_k]
+    if attn_mask.dtype == torch.bool:
+        # True=keep, False=mask
+        add = torch.zeros_like(attn_mask, dtype=q.dtype)
+        add = add.masked_fill(~attn_mask, float("-inf"))
+        return add
+    return attn_mask.to(q.dtype)
+
+def _build_causal_mask(T_q: int, T_k: int, device, dtype, q_start: int = 0):
+    # Absolute-position-aware causal mask:
+    # allow if key_pos <= query_pos, where
+    #   query_pos in [q_start, q_start + T_q)
+    #   key_pos   in [0, T_k)
+    q_pos = torch.arange(q_start, q_start + T_q, device=device)
+    k_pos = torch.arange(0, T_k, device=device)
+    allowed = q_pos[:, None] >= k_pos[None, :]  # [T_q, T_k] bool
+    mask = torch.zeros((T_q, T_k), device=device, dtype=dtype)
+    mask = mask.masked_fill(~allowed, float("-inf"))
+    return mask
+
+# Full Softmax Attention (with GQA, RoPE, gating, KV cache)
 class MultiHeadAttention(nn.Module):
     """Grouped-query gated attention used in Qwen3-Next."""
 
@@ -89,94 +130,127 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
+        assert self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
         self.num_groups = self.num_heads // self.num_kv_heads
         self.head_dim = config.head_dim
+
         rotary_factor = config.partial_rotary_factor if config.partial_rotary_factor > 0 else 1.0
         self.rotary_dim = max(2, int(self.head_dim * rotary_factor))
         if self.rotary_dim % 2:
             self.rotary_dim -= 1
+
         self.dropout = config.attention_dropout
 
+        # projections
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim * 2, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
 
+        # per-head RMSNorm on q and k 
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
         self.rotary_emb = RotaryEmbedding(config)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, num_heads: int) -> torch.Tensor:
+        # [B, T, H*D] -> [B, H, T, D]
         return tensor.view(*tensor.shape[:-1], num_heads, self.head_dim).transpose(1, 2).contiguous()
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,  # [B, T, hidden_size]
+        attention_mask: Optional[torch.Tensor] = None, # broadcastable to [B,H,T_q,T_k]
         past_kv: Optional[AttentionCache] = None,
-        cache_position: Optional[int] = None,
+        cache_position: Optional[int] = None, # decode start index if past_kv is given
+        use_sdpa: bool = True, 
     ) -> Tuple[torch.Tensor, AttentionCache]:
         batch_size, seq_len, _ = hidden_states.size()
         device = hidden_states.device
         dtype = hidden_states.dtype
 
-        q, gate = torch.chunk(self.q_proj(hidden_states), 2, dim=-1)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        # Q projection is doubled: first half is Q, second half is gate, Hkv - num_key_value_heads
+        q_all = self.q_proj(hidden_states)  # [B,T, 2*Hq*D]
+        q, gate = torch.chunk(q_all, 2, dim=-1)  # each [B,T, Hq*D]
+        k = self.k_proj(hidden_states)  # [B,T, Hkv*D]
+        v = self.v_proj(hidden_states)  # [B,T, Hkv*D]
 
-        q = self._shape(q, seq_len, self.num_heads)
-        k = self._shape(k, seq_len, self.num_kv_heads)
-        v = self._shape(v, seq_len, self.num_kv_heads)
+        q = self._shape(q, seq_len, self.num_heads)      # [B,Hq,T,D]
+        k = self._shape(k, seq_len, self.num_kv_heads)   # [B,Hkv,T,D]
+        v = self._shape(v, seq_len, self.num_kv_heads)   # [B,Hkv,T,D]
 
+        # Per-head normalization
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        cos, sin = self.rotary_emb(seq_len, device, dtype)
-        cos = cos[..., : self.rotary_dim]
-        sin = sin[..., : self.rotary_dim]
-        cos = cos.view(1, 1, seq_len, -1)
-        sin = sin.view(1, 1, seq_len, -1)
+        # RoPE
+        pos_start = int(cache_position) if (cache_position is not None) else 0
+        cos, sin = self.rotary_emb(seq_len, device, dtype, start_pos=pos_start)  # [T, rotary_dim]
+        cos = cos[..., : self.rotary_dim].view(1, 1, seq_len, -1)  # [1,1,T,rot_dim]
+        sin = sin[..., : self.rotary_dim].view(1, 1, seq_len, -1)
         q, k = apply_rotary(q, k, cos, sin, self.rotary_dim)
 
+        # KV cache handling: prefill vs decode
         if past_kv is not None and cache_position is not None:
-            past_kv.key[:, :, cache_position : cache_position + seq_len] = k
-            past_kv.value[:, :, cache_position : cache_position + seq_len] = v
-            k = past_kv.key[:, :, : cache_position + seq_len]
-            v = past_kv.value[:, :, : cache_position + seq_len]
+            # Append current [B,Hkv,T_cur,D] into preallocated cache at slice [pos:pos+T_cur]
+            end = cache_position + seq_len
+            past_kv.key[:, :, cache_position:end] = k
+            past_kv.value[:, :, cache_position:end] = v
+            k = past_kv.key[:, :, :end]
+            v = past_kv.value[:, :, :end]
         else:
+            # Prefill/training path: create a cache sized to current seq_len
             past_kv = create_attention_cache(
-                batch_size,
-                self.num_kv_heads,
-                self.head_dim,
-                seq_len,
-                device,
-                dtype,
+                batch_size, self.num_kv_heads, self.head_dim, seq_len, device, dtype
             )
             past_kv.key.copy_(k)
             past_kv.value.copy_(v)
 
-        repeat_shape = (1, self.num_groups, 1, 1)
-        k = k.repeat_interleave(self.num_groups, dim=1)
-        v = v.repeat_interleave(self.num_groups, dim=1)
+        # Expand KV for GQA
+        k = repeat_kv(k, self.num_groups)  # [B,Hq,T_k,D]
+        v = repeat_kv(v, self.num_groups)  # [B,Hq,T_k,D]
 
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        # Attention
+        attn_mask = _normalize_attn_mask(attention_mask, q)
+        T_q, T_k = q.size(-2), k.size(-2)
 
-        if attention_mask is not None:
-            attn_scores = attn_scores + attention_mask
+        if use_sdpa and q.is_cuda:
+            # Prefer FlashAttention via PyTorch SDPA where available
+            causal = attn_mask is None
+            # Let PyTorch choose the best kernel; ensure deterministic mask semantics
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=False, enable_math=True):
+                attn_output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=causal,
+                    # scale left as default 1/sqrt(D) for portability
+                )
+        else:
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if attn_mask is None:
+                # Use absolute-position-aware mask with q_start=pos_start
+                scores = scores + _build_causal_mask(
+                    T_q, T_k, device=scores.device, dtype=scores.dtype, q_start=pos_start
+                )
+            else:
+                scores = scores + attn_mask.to(scores.dtype)
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights.to(v.dtype), v)  # [B,Hq,T_q,D]
+        
+        # Merge heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)  # [B,T,Hq*D]
 
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
-
-        attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
-
-        gate = torch.sigmoid(gate)
+        # Gating (compute in fp32 for stability, then cast back)
+        gate = torch.sigmoid(gate.float()).to(attn_output.dtype)
         attn_output = attn_output * gate
 
-        attn_output = self.o_proj(attn_output)
+        # Output projection to hidden size
+        attn_output = self.o_proj(attn_output)  # [B,T,hidden]
         return attn_output, past_kv
 
 
@@ -291,13 +365,16 @@ class GatedDeltaNet(nn.Module):
                 self.activation,
             )
         else:
-            mixed_qkv = causal_conv1d_fn(
+            mixed_qkv_result = causal_conv1d_fn(
                 x=mixed_qkv,
                 weight=self.conv1d.weight.squeeze(1),
                 bias=self.conv1d.bias,
                 activation=self.activation,
                 seq_idx=None,
             )
+            if mixed_qkv_result is None:
+                raise ValueError("causal_conv1d_fn returned None")
+            mixed_qkv = mixed_qkv_result
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
@@ -327,7 +404,7 @@ class GatedDeltaNet(nn.Module):
                 value,
                 g=g,
                 beta=beta,
-                initial_state=None,
+                initial_state=None, #type: ignore
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
                 head_first=False,  # Inputs are [B, T, H, D] not [B, H, T, D]
